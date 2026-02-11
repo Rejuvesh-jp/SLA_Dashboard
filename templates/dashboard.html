@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SLA Monitoring Dashboard</title>
+    <link rel="icon" href="/static/favicon.ico">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <h1>
+                <span class="sla-title-wrap">
+                    <span>SLA Monitoring Dashboard</span>
+                </span>
+            </h1>
+            <div class="header-actions">
+                <button onclick="loadDashboardData()" class="btn-refresh">🔄 Refresh</button>
+                <span class="last-updated" id="lastUpdated" title="Data refreshes automatically every 5 minutes"></span>
+            </div>
+        </header>
+
+        <!-- Filters Section -->
+        <section class="filters-section">
+            <div class="filters-header">
+                <h2>Filters</h2>
+                <button onclick="clearAllFilters()" class="btn-clear-filters">Clear All</button>
+            </div>
+            <div class="filters-grid">
+                <div class="filter-group">
+                    <label for="filterPriority" title="Select priority to filter tickets">Priority</label>
+                    <select id="filterPriority" class="filter-select">
+                        <option value="">All Priorities</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filterSLA" title="Filter tickets by SLA status">SLA</label>
+                    <select id="filterSLA" class="filter-select">
+                        <option value="">All</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filterTeam" title="Filter tickets by assigned team">Team</label>
+                    <select id="filterTeam" class="filter-select">
+                        <option value="">All Teams</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filterAssignmentGroup" title="Filter tickets by assignment group">Assignment Group</label>
+                    <select id="filterAssignmentGroup" class="filter-select">
+                        <option value="">All Assignment Groups</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filterDateFrom" title="Filter tickets created on or after this date">Created Date From</label>
+                    <input type="date" id="filterDateFrom" class="filter-date">
+                </div>
+                <div class="filter-group">
+                    <label for="filterDateTo" title="Filter tickets created on or before this date">Created Date To</label>
+                    <input type="date" id="filterDateTo" class="filter-date">
+                </div>
+            </div>
+        </section>
+
+        <!-- SLA Legend -->
+        <section class="legend-section">
+            <h3>SLA Status Legend</h3>
+            <div class="legend-items">
+                <div class="legend-item">
+                    <span class="legend-color legend-breached"></span>
+                    <span class="legend-label">SLA Breached</span>
+                    <span class="legend-description">SLA deadline has passed</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-color legend-pending"></span>
+                    <span class="legend-label">Pending But Complaint</span>
+                    <span class="legend-description">Pending but complaint status</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- KPI Cards -->
+        <section class="kpi-section">
+            <div class="kpi-card" title="Total number of tickets in the system">
+                <div class="kpi-label">Total Tickets</div>
+                <div class="kpi-value" id="kpi-total">-</div>
+            </div>
+            <div class="kpi-card kpi-breached" title="Tickets that have exceeded their SLA deadline">
+                <div class="kpi-label">Breached</div>
+                <div class="kpi-value" id="kpi-breached">-</div>
+            </div>
+            <div class="kpi-card kpi-pending" title="Tickets with pending but complaint status">
+                <div class="kpi-label">Pending</div>
+                <div class="kpi-value" id="kpi-pending">-</div>
+            </div>
+        </section>
+
+        <!-- Charts Section -->
+        <section class="charts-section">
+            <div class="chart-row">
+                <div class="chart-card">
+                    <h3 title="Distribution of tickets by their SLA status">Tickets by SLA Status</h3>
+                    <canvas id="chart-sla-status"></canvas>
+                    <div id="chart-sla-status-empty" class="chart-empty-state" style="display: none;">
+                        <p>No data available</p>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3 title="Distribution of tickets by priority level">Tickets by Priority</h3>
+                    <canvas id="chart-priority"></canvas>
+                    <div id="chart-priority-empty" class="chart-empty-state" style="display: none;">
+                        <p>No data available</p>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-card">
+                    <h3 title="Number of tickets assigned to each team">Tickets by Team</h3>
+                    <canvas id="chart-team"></canvas>
+                    <div id="chart-team-empty" class="chart-empty-state" style="display: none;">
+                        <p>No data available</p>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3 title="Tickets grouped by hours outstanding (0-4 hrs, 4-8 hrs, 8-24 hrs, >24 hrs)">Aging Buckets</h3>
+                    <canvas id="chart-aging"></canvas>
+                    <div id="chart-aging-empty" class="chart-empty-state" style="display: none;">
+                        <p>No data available</p>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-card chart-full">
+                    <h3 title="Trend of SLA breached tickets over time">SLA Breach Trend Over Time</h3>
+                    <canvas id="chart-trend"></canvas>
+                    <div id="chart-trend-empty" class="chart-empty-state" style="display: none;">
+                        <p>No data available</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Data Table Section -->
+        <section class="table-section">
+            <div class="table-header">
+                <h2>Ticket Details</h2>
+                <div class="table-controls">
+                    <input type="text" id="searchInput" placeholder="Search tickets..." class="search-input" title="Search across all ticket fields">
+                </div>
+            </div>
+            <div class="table-wrapper">
+                <table id="ticketsTable" class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Priority</th>
+                            <th>SLA</th>
+                            <th>Hours Outstanding</th>
+                            <th>Days Standing</th>
+                            <th>SLA Countdown</th>
+                            <th>Team</th>
+                            <th>Assignment Group</th>
+                            <th>Created</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ticketsTableBody">
+                        <tr>
+                            <td colspan="9" class="loading">Loading data...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="table-footer">
+                <div class="table-info">
+                    <span id="tableCount">Showing 0 tickets</span>
+                    <select id="pageSize" class="page-size-select">
+                        <option value="25">25 per page</option>
+                        <option value="50">50 per page</option>
+                        <option value="100">100 per page</option>
+                        <option value="200">200 per page</option>
+                    </select>
+                </div>
+                <div class="pagination" id="pagination">
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Recently Closed Tickets Panel -->
+    <button onclick="toggleClosedTicketsPanel()" style="position: fixed; bottom: 20px; right: 20px; z-index: 1001; padding: 10px 16px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer;">
+        Recently Closed Tickets
+    </button>
+    <div id="closedTicketsPanel" class="closed-panel">
+        <div class="closed-tickets-header">
+            <h3>Recently Closed Tickets</h3>
+        </div>
+        <div id="closedTicketsList" class="closed-tickets-list">
+            <div class="closed-ticket-empty">No recently closed tickets</div>
+        </div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>
+
