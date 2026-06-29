@@ -187,10 +187,11 @@ def _find_named_excel_file(items: List[Dict[str, Any]], file_name: str) -> Tuple
     raise RuntimeError(f"Excel file not found in OneDrive folder: {file_name}")
 
 
-def fetch_latest_excel_first_sheet_as_dataframe() -> pd.DataFrame:
+def fetch_latest_excel_first_sheet_as_dataframe():
     """
     Fetch the most recently modified Excel file from the configured OneDrive folder,
     download it, and load the first worksheet (index 0) into a DataFrame.
+    Returns (DataFrame, filename) tuple.
     """
     items = _list_onedrive_folder_children(SHAREPOINT_FOLDER_PATH)
     _, latest_name, _ = _pick_latest_excel_file(items)
@@ -205,8 +206,8 @@ def fetch_latest_excel_first_sheet_as_dataframe() -> pd.DataFrame:
     engine = "openpyxl" if latest_name.lower().endswith(".xlsx") else None
     df = pd.read_excel(bio, sheet_name=0, engine=engine)
     if df is None:
-        return pd.DataFrame()
-    return df
+        return pd.DataFrame(), latest_name
+    return df, latest_name
 
 
 def fetch_configured_excel_first_sheet_as_dataframe() -> pd.DataFrame:

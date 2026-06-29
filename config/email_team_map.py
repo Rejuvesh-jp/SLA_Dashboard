@@ -12,7 +12,7 @@ EMAIL_TEAM_MAP = {
     "kamaladass@titan.co.in": "ECOM",
     "varunkumar@titan.co.in": "Watches",
     "muruganandham@titan.co.in": "ECOM",
-    "ganesh_b@titan.co.in": "Others",
+    "ganesh_b@titan.co.in": "Jewellery",
     "naveenn@titan.co.in": "EyePlus",
     "dineshbalaji.a@caratlane.com": "Caratlane",
     "donam@titan.co.in": "Jewellery",
@@ -61,5 +61,7 @@ EMAIL_TEAM_MAP = {
     "dbasupport@titan.co.in": "Database",
     "kathir@titan.co.in": "Jewellery",
     "premak@titan.co.in": "Jewellery",
-    "arunvasam@titan.co.in": "Watches"
+    "arunvasam@titan.co.in": "Watches",
+    "anavindhyas@titan.co.in": "Analytics",
+    "abhi.pandit@titan.co.in": "Analytics-AIML"
 }

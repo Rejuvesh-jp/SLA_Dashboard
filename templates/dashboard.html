@@ -6,6 +6,9 @@
     <title>SLA Monitoring Dashboard</title>
     <link rel="icon" href="/static/favicon.ico">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -18,8 +21,19 @@
                 </span>
             </h1>
             <div class="header-actions">
+                <!-- File Upload -->
+                <div class="upload-area" id="uploadArea">
+                    <label for="fileUploadInput" class="btn-upload" title="Upload Excel or CSV file">
+                        &#128196; Upload File
+                    </label>
+                    <input type="file" id="fileUploadInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleFileUpload(this)">
+                    <span id="uploadedFileName" class="upload-filename"></span>
+                    <button id="clearUploadBtn" onclick="clearUploadedFile()" class="btn-clear-upload" title="Clear uploaded file" style="display:none">&#x2715;</button>
+                </div>
+                <button onclick="openHistoryModal()" class="btn-history">&#128202; History</button>
+                <button onclick="generatePDF()" class="btn-pdf" title="Download PDF report">&#128196; Download PDF</button>
                 <button onclick="loadDashboardData()" class="btn-refresh">🔄 Refresh</button>
-                <span class="last-updated" id="lastUpdated" title="Data refreshes automatically every 5 minutes"></span>
+                <span class="last-updated" id="lastUpdated" title="Data refreshes automatically every 3 minutes"></span>
             </div>
         </header>
 
@@ -88,13 +102,21 @@
                 <div class="kpi-label">Total Tickets</div>
                 <div class="kpi-value" id="kpi-total">-</div>
             </div>
-            <div class="kpi-card kpi-breached" title="Tickets that have exceeded their SLA deadline">
-                <div class="kpi-label">Breached</div>
+            <div class="kpi-card kpi-breached" title="Tickets that breached SLA — includes both ongoing and resolved">
+                <div class="kpi-label">SLA Breached (All)</div>
                 <div class="kpi-value" id="kpi-breached">-</div>
             </div>
-            <div class="kpi-card kpi-pending" title="Tickets with pending but complaint status">
+            <div class="kpi-card kpi-pending" title="Open tickets (Pending with customer) — includes those within SLA and those that breached">
                 <div class="kpi-label">Pending</div>
                 <div class="kpi-value" id="kpi-pending">-</div>
+            </div>
+            <div class="kpi-card kpi-wip" title="Tickets currently being worked on">
+                <div class="kpi-label">Work in Progress</div>
+                <div class="kpi-value" id="kpi-wip">-</div>
+            </div>
+            <div class="kpi-card kpi-resolved" title="Tickets that have been resolved">
+                <div class="kpi-label">Resolved</div>
+                <div class="kpi-value" id="kpi-resolved">-</div>
             </div>
         </section>
 
@@ -109,7 +131,7 @@
                     </div>
                 </div>
                 <div class="chart-card">
-                    <h3 title="Distribution of tickets by priority level">Tickets by Priority</h3>
+                    <h3 title="SLA-breached tickets broken down by priority">Breached by Priority</h3>
                     <canvas id="chart-priority"></canvas>
                     <div id="chart-priority-empty" class="chart-empty-state" style="display: none;">
                         <p>No data available</p>
@@ -149,6 +171,7 @@
                 <h2>Ticket Details</h2>
                 <div class="table-controls">
                     <input type="text" id="searchInput" placeholder="Search tickets..." class="search-input" title="Search across all ticket fields">
+                    <button onclick="exportToCSV()" class="btn-export" title="Export current view to CSV">⬇ Export CSV</button>
                 </div>
             </div>
             <div class="table-wrapper">
@@ -156,11 +179,14 @@
                     <thead>
                         <tr>
                             <th>Number</th>
+                            <th>State</th>
                             <th>Priority</th>
                             <th>SLA</th>
+                            <th>Breached</th>
                             <th>Hours Outstanding</th>
                             <th>Days Standing</th>
                             <th>SLA Countdown</th>
+                            <th>Resolution Time</th>
                             <th>Team</th>
                             <th>Assignment Group</th>
                             <th>Created</th>
@@ -189,20 +215,20 @@
         </section>
     </div>
 
-    <!-- Recently Closed Tickets Panel -->
-    <button onclick="toggleClosedTicketsPanel()" style="position: fixed; bottom: 20px; right: 20px; z-index: 1001; padding: 10px 16px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer;">
-        Recently Closed Tickets
-    </button>
-    <div id="closedTicketsPanel" class="closed-panel">
-        <div class="closed-tickets-header">
-            <h3>Recently Closed Tickets</h3>
-        </div>
-        <div id="closedTicketsList" class="closed-tickets-list">
-            <div class="closed-ticket-empty">No recently closed tickets</div>
+    <script src="/static/dashboard.js?v=12"></script>
+
+    <!-- History Modal -->
+    <div id="historyModalOverlay" class="history-modal-overlay" onclick="if(event.target===this)closeHistoryModal()">
+        <div class="history-modal">
+            <div class="history-modal-header">
+                <h2 id="historyModalTitle">&#128202; Snapshot History</h2>
+                <button class="ticket-modal-close" onclick="closeHistoryModal()">&#10005;</button>
+            </div>
+            <div class="history-modal-body" id="historyModalBody">
+                <div class="history-loading">Loading...</div>
+            </div>
         </div>
     </div>
-
-    <script src="/static/dashboard.js"></script>
 </body>
 </html>
 

@@ -1,4 +1,4 @@
-/*************************
+﻿/*************************
  * GLOBAL STATE & CONFIG
  *************************/
 let allTickets = [];
@@ -8,8 +8,10 @@ let sortConfig = { column: null, direction: 'asc' };
 let paginationConfig = { currentPage: 1, pageSize: 25 };
 let autoRefreshInterval = null;
 let tableFilterState = {
+    State: '',
     Priority: '',
     SLA: '',
+    Breached: '',
     Team: '',
     'Assignment group': '',
     Created: ''
@@ -17,16 +19,19 @@ let tableFilterState = {
 let previousTickets = new Set();
 let closedTickets = [];
 
-const AUTO_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const AUTO_REFRESH_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
 const API_BASE = '';
 
 const TABLE_COLUMNS = [
     'Number',
+    'State',
     'Priority',
     'SLA',
+    'Breached',
     'Hours Outstanding',
     'Days Standing',
     'SLA Countdown',
+    'Resolution Time',
     'Team',
     'Assignment group',
     'Created'
@@ -36,8 +41,12 @@ const TABLE_COLUMNS = [
  * INIT
  *************************/
 document.addEventListener('DOMContentLoaded', async () => {
+    // Register datalabels plugin globally (must be done before any chart is created)
+    if (window.ChartDataLabels) {
+        Chart.register(ChartDataLabels);
+    }
+    await checkUploadStatus();
     await loadDashboardData();
-    loadRecentlyClosedTickets();
     setupEventListeners();
     setupTableColumnFilters();
     startAutoRefresh();
@@ -197,30 +206,49 @@ function fillSelect(id, values, multi = false) {
 }
 
 /*************************
+ * RESOLVED STATE HELPER
+ * FE tickets use 'Closed' instead of 'Resolved' — treat both as resolved.
+ *************************/
+function isResolvedState(state) {
+    const s = String(state || '').trim().toLowerCase();
+    return s === 'resolved' || s === 'closed';
+}
+
+/*************************
  * KPI CALCULATION
  *************************/
 function calculateKPIs(tickets) {
-    let breached = 0;
     let pending = 0;
+    let workInProgress = 0;
+    let resolved = 0;
+    let slaBreached = 0;
 
     tickets.forEach(t => {
-        const status = t['SLA'] || '';
-        // Use exact equality - no pattern matching
-        if (status === 'SLA Breached') breached++;
-        else if (status === 'Pending But Complaint') pending++;
+        // State-based counts (mutually exclusive)
+        const state = String(t['State'] || '').trim();
+        if (isResolvedState(state)) resolved++;
+        else if (state === 'Work in Progress') workInProgress++;
+        else pending++;  // all other open tickets (Pending with customer, etc.)
+
+        // Cross-cutting: did this ticket breach SLA? (ongoing OR resolved)
+        if (isSLABreached(t)) slaBreached++;
     });
 
     return {
         total: tickets.length,
-        breached,
-        pending
+        pending,
+        workInProgress,
+        resolved,
+        slaBreached
     };
 }
 
 function updateKPIs(kpis) {
     document.getElementById('kpi-total').textContent = kpis.total;
-    document.getElementById('kpi-breached').textContent = kpis.breached;
+    document.getElementById('kpi-breached').textContent = kpis.slaBreached;
     document.getElementById('kpi-pending').textContent = kpis.pending;
+    document.getElementById('kpi-wip').textContent = kpis.workInProgress;
+    document.getElementById('kpi-resolved').textContent = kpis.resolved;
 }
 
 /*************************
@@ -228,8 +256,10 @@ function updateKPIs(kpis) {
  *************************/
 function getSLAStatusColor(label) {
     const status = String(label || '');
-    if (status === 'SLA Breached') return '#ef4444'; // Red
+    if (status === 'SLA Breached') return '#ef4444';         // Red
     if (status === 'Pending But Complaint') return '#10b981'; // Green
+    if (status === 'Resolved Within SLA') return '#60a5fa';  // Blue
+    if (status === 'Resolved' || status === 'Closed') return '#60a5fa'; // Blue
     return '#6b7280'; // Default gray
 }
 
@@ -249,10 +279,16 @@ function calculateChartData(tickets) {
     const slaValues = Object.values(slaData);
     const slaColors = slaLabels.map(getSLAStatusColor);
 
-    // Priority chart
-    const priorityData = countBy('Priority');
-    const priorityLabels = Object.keys(priorityData);
-    const priorityValues = Object.values(priorityData);
+    // Breached by Priority chart â€” count of SLA-breached tickets per priority
+    const breachedByPriority = {};
+    tickets.forEach(t => {
+        if (isSLABreached(t)) {
+            const p = t.Priority || 'Unknown';
+            breachedByPriority[p] = (breachedByPriority[p] || 0) + 1;
+        }
+    });
+    const priorityLabels = Object.keys(breachedByPriority).sort();
+    const priorityValues = priorityLabels.map(k => breachedByPriority[k]);
 
     // Team chart
     const teamData = countBy('Team');
@@ -369,7 +405,7 @@ function createDonutChart(canvasId, data) {
             labels: data.labels,
             datasets: [{
                 data: data.values,
-                // 3D gradients (lighter toward center, darker toward edge) – SLA chart only
+                // 3D gradients (lighter toward center, darker toward edge) â€“ SLA chart only
                 backgroundColor: isSLAStatusChart
                     ? (context) => {
                         const i = context.dataIndex;
@@ -403,6 +439,13 @@ function createDonutChart(canvasId, data) {
                     bodyColor: '#F9FAFB',
                     borderColor: 'rgba(255, 255, 255, 0.10)',
                     borderWidth: 1
+                },
+                datalabels: {
+                    color: '#ffffff',
+                    font: { weight: 'bold', size: 12 },
+                    formatter: (value) => value > 0 ? value : '',
+                    textShadowBlur: 4,
+                    textShadowColor: 'rgba(0,0,0,0.6)'
                 }
             }
         },
@@ -464,7 +507,7 @@ function createBarChart(canvasId, data) {
     });
 }
 
-// Tickets by Priority ONLY (chart-priority): custom colors + 3D-like depth
+// Breached by Priority (chart-priority): custom colors + 3D-like depth
 function createPriorityBarChart(canvasId, data) {
     const ctxEl = document.getElementById(canvasId);
     if (!ctxEl) return;
@@ -499,9 +542,9 @@ function createPriorityBarChart(canvasId, data) {
         const bottom = props && typeof props.base === 'number' ? props.base : (chart.chartArea?.bottom ?? chart.height);
 
         // Requirement-specific colors for this chart (label-based, order-independent):
-        // - Priority 1 – Critical → Red
-        // - Priority 2 – High → Yellow
-        // - Priority 3 – Moderate → Blue
+        // - Priority 1 â€“ Critical â†’ Red
+        // - Priority 2 â€“ High â†’ Yellow
+        // - Priority 3 â€“ Moderate â†’ Blue
         if (key === 'P1') {
             // Red (with subtle depth shading, still clearly "red")
             const g = chart.ctx.createLinearGradient(0, top, 0, bottom);
@@ -602,7 +645,7 @@ function createPriorityBarChart(canvasId, data) {
         data: {
             labels: data.labels,
             datasets: [{
-                label: 'Count',
+                label: 'Breached',
                 data: data.values,
                 backgroundColor: (context) => fillForIndex(context.chart, context.dataIndex),
                 borderColor: (context) => borderForLabel(data.labels[context.dataIndex]),
@@ -612,6 +655,7 @@ function createPriorityBarChart(canvasId, data) {
         options: {
             responsive: true,
             maintainAspectRatio: true,
+            layout: { padding: { top: 24 } },
             scales: {
                 y: {
                     beginAtZero: true,
@@ -631,6 +675,14 @@ function createPriorityBarChart(canvasId, data) {
                     bodyColor: '#F9FAFB',
                     borderColor: 'rgba(255, 255, 255, 0.10)',
                     borderWidth: 1
+                },
+                datalabels: {
+                    anchor: 'end',
+                    align: 'top',
+                    clip: false,
+                    color: '#F9FAFB',
+                    font: { weight: 'bold', size: 12 },
+                    formatter: (value) => value > 0 ? value : ''
                 }
             }
         },
@@ -784,7 +836,7 @@ function createTeamBarChart(canvasId, data, tickets) {
     const team3DAndChips = {
         id: 'team3DAndChips',
 
-        // 3D effect (shadow) — makes bars look lifted from the canvas
+        // 3D effect (shadow) â€” makes bars look lifted from the canvas
         beforeDatasetDraw(chart, args) {
             // In OVERALL (stacked) mode, apply to each stacked dataset; otherwise keep original behavior.
             if (chart._teamFilterMode !== TEAM_FILTER_MODES.OVERALL && args.index !== 0) return;
@@ -855,7 +907,7 @@ function createTeamBarChart(canvasId, data, tickets) {
                 borderColor: shadeHex(STATUS_BASE.BREACHED, -85),
                 borderWidth: 1,
                 borderRadius: 6,
-                // Thicker bars (3D look) — scoped to this chart only
+                // Thicker bars (3D look) â€” scoped to this chart only
                 barThickness: 'flex',
                 maxBarThickness: 46,
                 categoryPercentage: 0.78,
@@ -877,6 +929,7 @@ function createTeamBarChart(canvasId, data, tickets) {
         options: {
             responsive: true,
             maintainAspectRatio: true,
+            layout: { padding: { top: 24 } },
             // Animate bars upward from zero with smooth easing
             animation: {
                 duration: 1200,
@@ -915,6 +968,18 @@ function createTeamBarChart(canvasId, data, tickets) {
                             }
                             return `Count: ${val}`;
                         }
+                    }
+                },
+                datalabels: {
+                    anchor: 'end',
+                    align: 'top',
+                    clip: false,
+                    color: '#F9FAFB',
+                    font: { weight: 'bold', size: 11 },
+                    formatter: (value, context) => {
+                        // Hide numbers in Overall (stacked) mode
+                        if (context.chart._teamFilterMode === TEAM_FILTER_MODES.OVERALL) return '';
+                        return value > 0 ? value : '';
                     }
                 }
             }
@@ -1203,6 +1268,7 @@ function createHorizontalBarChart(canvasId, data) {
             indexAxis: 'y',
             responsive: true,
             maintainAspectRatio: true,
+            layout: { padding: { right: 32 } },
             scales: {
                 x: {
                     beginAtZero: true,
@@ -1222,6 +1288,14 @@ function createHorizontalBarChart(canvasId, data) {
                     bodyColor: '#F9FAFB',
                     borderColor: 'rgba(255, 255, 255, 0.10)',
                     borderWidth: 1
+                },
+                datalabels: {
+                    anchor: 'end',
+                    align: 'right',
+                    clip: false,
+                    color: '#F9FAFB',
+                    font: { weight: 'bold', size: 12 },
+                    formatter: (value) => value > 0 ? value : ''
                 }
             }
         },
@@ -1243,6 +1317,39 @@ function createLineChart(canvasId, data) {
     }
     document.getElementById(canvasId + '-empty')?.style.setProperty('display', 'none');
 
+    // Premium styling plugins (scoped to this chart instance only)
+    const lineGlow = {
+        id: 'slaTrendLineGlow',
+        beforeDatasetDraw(chart, args) {
+            if (args.index !== 0) return;
+            const c = chart.ctx;
+            c.save();
+            c.shadowBlur = 15;
+            c.shadowColor = 'rgba(255,0,0,0.6)';
+            c.shadowOffsetX = 0;
+            c.shadowOffsetY = 0;
+        },
+        afterDatasetDraw(chart, args) {
+            if (args.index !== 0) return;
+            chart.ctx.restore();
+        }
+    };
+
+    const tooltipShadow = {
+        id: 'slaTrendTooltipShadow',
+        beforeTooltipDraw(chart) {
+            const c = chart.ctx;
+            c.save();
+            c.shadowColor = 'rgba(0,0,0,0.45)';
+            c.shadowBlur = 14;
+            c.shadowOffsetX = 0;
+            c.shadowOffsetY = 8;
+        },
+        afterTooltipDraw(chart) {
+            chart.ctx.restore();
+        }
+    };
+
     chartInstances[canvasId] = new Chart(ctx, {
         type: 'line',
         data: {
@@ -1250,16 +1357,45 @@ function createLineChart(canvasId, data) {
             datasets: [{
                 label: 'SLA Breached Tickets',
                 data: data.values,
-                borderColor: '#ef4444',
-                backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                borderWidth: 2,
+                borderColor: (context) => {
+                    const chart = context.chart;
+                    const area = chart.chartArea;
+                    if (!area) return '#ef4444';
+                    const g = chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
+                    // dark red -> bright red
+                    g.addColorStop(0, '#b00020');
+                    g.addColorStop(0.55, '#ff3b3b');
+                    g.addColorStop(1, '#ff6b6b');
+                    return g;
+                },
+                backgroundColor: (context) => {
+                    const chart = context.chart;
+                    const area = chart.chartArea;
+                    if (!area) return 'rgba(255, 59, 59, 0.08)';
+                    const g = chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
+                    g.addColorStop(0, 'rgba(255, 59, 59, 0.22)');
+                    g.addColorStop(0.55, 'rgba(255, 59, 59, 0.10)');
+                    g.addColorStop(1, 'rgba(255, 59, 59, 0.00)');
+                    return g;
+                },
+                borderWidth: 3,
                 fill: true,
-                tension: 0.4
+                tension: 0.4,
+                pointRadius: 4,
+                pointHoverRadius: 8,
+                pointBackgroundColor: '#ffffff',
+                pointBorderColor: '#ff3b3b',
+                pointBorderWidth: 2
             }]
         },
         options: {
             responsive: true,
             maintainAspectRatio: true,
+            animation: {
+                duration: 1500,
+                easing: 'easeInOutQuart'
+            },
+            layout: { padding: { top: 24 } },
             scales: {
                 y: {
                     beginAtZero: true,
@@ -1277,14 +1413,25 @@ function createLineChart(canvasId, data) {
                     labels: { color: '#F9FAFB' }
                 },
                 tooltip: {
-                    backgroundColor: 'rgba(17, 24, 39, 0.88)',
-                    titleColor: '#F9FAFB',
-                    bodyColor: '#F9FAFB',
-                    borderColor: 'rgba(255, 255, 255, 0.10)',
-                    borderWidth: 1
+                    backgroundColor: 'rgba(20,20,20,0.95)',
+                    titleColor: '#ffffff',
+                    bodyColor: '#ffffff',
+                    borderColor: 'rgba(255,255,255,0.10)',
+                    borderWidth: 1,
+                    cornerRadius: 12,
+                    padding: 12
+                },
+                datalabels: {
+                    align: 'top',
+                    anchor: 'end',
+                    clip: false,
+                    color: '#F9FAFB',
+                    font: { weight: 'bold', size: 11 },
+                    formatter: (value) => value > 0 ? value : ''
                 }
             }
-        }
+        },
+        plugins: [lineGlow, tooltipShadow]
     });
 }
 
@@ -1296,11 +1443,20 @@ function renderTable(tickets) {
     
     // Apply column filters (only affects table display, not charts/KPIs)
     let tableFilteredTickets = tickets.filter(t => {
+        // State filter
+        if (tableFilterState.State && String(t['State'] || '') !== tableFilterState.State) return false;
+
         // Priority filter
         if (tableFilterState.Priority && t.Priority !== tableFilterState.Priority) return false;
         
         // SLA filter
         if (tableFilterState.SLA && t['SLA'] !== tableFilterState.SLA) return false;
+
+        // Breached filter
+        if (tableFilterState.Breached !== '') {
+            const isBreached = isSLABreached(t) ? 'Yes' : 'No';
+            if (isBreached !== tableFilterState.Breached) return false;
+        }
         
         // Team filter
         if (tableFilterState.Team && t.Team !== tableFilterState.Team) return false;
@@ -1321,7 +1477,7 @@ function renderTable(tickets) {
     });
     
     if (!tableFilteredTickets.length) {
-        tbody.innerHTML = `<tr><td colspan="9">No tickets found</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="12">No tickets found</td></tr>`;
         return;
     }
 
@@ -1330,21 +1486,33 @@ function renderTable(tickets) {
 
     tbody.innerHTML = page.map(t => {
         const sla = t['SLA'] || '';
+        const state = String(t['State'] || '');
         let rowClass = '';
         if (sla === 'SLA Breached') rowClass = 'row-breached';
         else if (sla === 'Pending But Complaint') rowClass = 'row-pending';
+        else if (sla === 'Resolved Within SLA' || sla === 'Resolved' || isResolvedState(state)) rowClass = 'row-resolved';
+        if (state === 'Work in Progress') rowClass = 'row-wip';
         
         const countdown = calculateSLACountdown(t);
         const daysStanding = calculateDaysStanding(t);
+        const resolutionTime = formatResolutionTime(t);
+        const breached = isSLABreached(t);
+        const breachedCell = breached
+            ? '<span class="badge-breached">&#10006; Yes</span>'
+            : '<span class="badge-ok">&#10003; No</span>';
         
+        const ticketIdx = allTickets.findIndex(x => x.Number === t.Number);
         return `
-        <tr class="${rowClass}">
+        <tr class="${rowClass}" onclick="openTicketModal(${ticketIdx})" style="cursor:pointer;">
             <td>${t.Number || ''}</td>
+            <td>${state}</td>
             <td>${t.Priority || ''}</td>
             <td>${sla}</td>
+            <td>${breachedCell}</td>
             <td>${calculateHoursOutstanding(t)}</td>
             <td>${daysStanding}</td>
             <td class="${countdown.class}">${countdown.text}</td>
+            <td>${resolutionTime}</td>
             <td>${t.Team || ''}</td>
             <td>${t['Assignment group'] || ''}</td>
             <td>${formatDate(t.Created)}</td>
@@ -1373,8 +1541,19 @@ function applyFilters() {
         if (search) {
             const countdown = calculateSLACountdown(t);
             const daysStanding = calculateDaysStanding(t);
+            const breachedText = isSLABreached(t) ? 'breached yes' : 'no';
+
+            // Extract first email only (before comma or semicolon)
+            const rawEmail = String(t['Email'] || t['email'] || '').trim();
+            const firstEmail = rawEmail.includes(',') ? rawEmail.split(',')[0].trim()
+                             : rawEmail.includes(';') ? rawEmail.split(';')[0].trim()
+                             : rawEmail;
+
             const searchable = [
-                t.Number, t.Priority, t['SLA'], countdown.text, daysStanding, t.Team, t['Assignment group'], t.Created
+                t.Number, t.State, t.Priority, t['SLA'], breachedText,
+                countdown.text, daysStanding, t.Team, t['Assignment group'],
+                t.Created, firstEmail, t.Description, t['Short description'],
+                t['Caller'], t['Opened by'], t['Resolved by']
             ].map(v => String(v || '').toLowerCase()).join(' ');
             if (!searchable.includes(search)) return false;
         }
@@ -1424,7 +1603,10 @@ function handleSort(columnIndex) {
         let x = a[column];
         let y = b[column];
 
-        if (column === 'Hours Outstanding') {
+        if (column === 'Breached') {
+            x = isSLABreached(a) ? 1 : 0;
+            y = isSLABreached(b) ? 1 : 0;
+        } else if (column === 'Hours Outstanding') {
             const hoursA = calculateHoursOutstanding(a);
             const hoursB = calculateHoursOutstanding(b);
             x = hoursA === '' ? 0 : parseFloat(hoursA) || 0;
@@ -1531,13 +1713,52 @@ function startAutoRefresh() {
 }
 
 /*************************
+ * SLA BREACH CHECK (cross-cutting)
+ * Returns true if ticket breached SLA, regardless of current state.
+ * - Ongoing (not Resolved): elapsed time > SLA hours
+ * - Resolved: resolution time > SLA hours
+ *************************/
+function isSLABreached(ticket) {
+    if (!ticket.Priority || !ticket.Created) return false;
+    const priorityStr = String(ticket.Priority || '').trim();
+    const match = priorityStr.match(/^(\d)/);
+    if (!match) return false;
+    const priorityDigit = parseInt(match[1], 10);
+    let slaHours = 0;
+    if (priorityDigit === 1) slaHours = 4;
+    else if (priorityDigit === 2) slaHours = 12;
+    else if (priorityDigit === 3) slaHours = 24;
+    else return false;
+
+    const state = String(ticket.State || '').trim();
+    if (isResolvedState(state)) {
+        const rt = ticket['Resolution Time (hrs)'];
+        if (rt !== null && rt !== undefined && rt !== '') {
+            // Excel-resolved: use actual resolution time
+            return parseFloat(rt) >= slaHours;
+        }
+        // Manually-resolved (no resolution time from Excel):
+        // use elapsed time from Created to now as a proxy
+        const createdDate = new Date(ticket.Created);
+        if (isNaN(createdDate.getTime())) return false;
+        const elapsedHours = (Date.now() - createdDate.getTime()) / 3600000;
+        return elapsedHours >= slaHours;
+    } else {
+        const createdDate = new Date(ticket.Created);
+        if (isNaN(createdDate.getTime())) return false;
+        const elapsedHours = (Date.now() - createdDate.getTime()) / 3600000;
+        return elapsedHours >= slaHours;
+    }
+}
+
+/*************************
  * SLA STATUS COMPUTATION
  *************************/
 function computeSLAStatus(ticket) {
-    // SLA is computed ONLY on the frontend from Priority + Created.
-    // Ignore any SLA value coming from Excel.
+    // SLA is computed ONLY on the frontend from State + Priority + Created.
 
-    if (!ticket || !ticket.Priority || !ticket.Created) return '';
+    if (!ticket) return '';
+    if (!ticket.Priority || !ticket.Created) return '';
 
     const createdDate = new Date(ticket.Created);
     if (isNaN(createdDate.getTime())) return '';
@@ -1554,10 +1775,25 @@ function computeSLAStatus(ticket) {
     else if (priorityDigit === 3) slaHours = 24;
     else return '';
 
+    const state = String(ticket.State || '').trim();
+
+    if (isResolvedState(state)) {
+        // For resolved tickets: compare resolution time against SLA hours
+        const rt = ticket['Resolution Time (hrs)'];
+        if (rt !== null && rt !== undefined && rt !== '') {
+            // Excel-resolved: use actual resolution time
+            return parseFloat(rt) >= slaHours ? 'SLA Breached' : 'Resolved Within SLA';
+        }
+        // Manually-resolved (no resolution time from Excel):
+        // use elapsed time from Created as a proxy
+        const elapsedHours = (Date.now() - createdDate.getTime()) / 3600000;
+        return elapsedHours >= slaHours ? 'SLA Breached' : 'Resolved Within SLA';
+    }
+
+    // Ongoing tickets: compare elapsed time
     const elapsedHours = (Date.now() - createdDate.getTime()) / 3600000;
     if (!isFinite(elapsedHours)) return '';
 
-    // Within SLA window => Pending But Complaint, otherwise => SLA Breached
     return elapsedHours >= slaHours ? 'SLA Breached' : 'Pending But Complaint';
 }
 
@@ -1565,6 +1801,11 @@ function computeSLAStatus(ticket) {
  * SLA COUNTDOWN CALCULATION
  *************************/
 function calculateSLACountdown(ticket) {
+    // Resolved tickets: no countdown needed
+    if (isResolvedState(ticket['State']) || ticket['SLA'] === 'Resolved' || ticket['SLA'] === 'Resolved Within SLA') {
+        return { text: 'Resolved', class: 'countdown-resolved' };
+    }
+
     // Edge cases: Missing Priority or invalid Created date
     if (!ticket.Priority || !ticket.Created) {
         return { text: 'N/A', class: 'countdown-na' };
@@ -1584,7 +1825,7 @@ function calculateSLACountdown(ticket) {
     
     const priorityDigit = parseInt(match[1], 10);
     
-    // SLA HOURS MAPPING: 1 → 4 hours, 2 → 12 hours, 3 → 24 hours
+    // SLA HOURS MAPPING: 1 â†’ 4 hours, 2 â†’ 12 hours, 3 â†’ 24 hours
     let slaHours = 0;
     if (priorityDigit === 1) slaHours = 4;
     else if (priorityDigit === 2) slaHours = 12;
@@ -1610,7 +1851,7 @@ function calculateSLACountdown(ticket) {
         const minutes = remainingMinutes % 60;
         text = `${hours}h ${minutes}m remaining`;
         
-        // Color Logic: Remaining > 25% SLA → green, Remaining <= 25% SLA → amber
+        // Color Logic: Remaining > 25% SLA â†’ green, Remaining <= 25% SLA â†’ amber
         const percentRemaining = (remaining / slaHours) * 100;
         if (percentRemaining > 25) {
             colorClass = 'countdown-green';
@@ -1631,14 +1872,39 @@ function calculateSLACountdown(ticket) {
 }
 
 /*************************
+ * RESOLUTION TIME HELPER
+ *************************/
+function formatResolutionTime(ticket) {
+    const sla = ticket['SLA'] || '';
+    if (sla !== 'Resolved' && sla !== 'Resolved Within SLA' && sla !== 'SLA Breached') return 'â€”';
+    if (!isResolvedState(String(ticket.State || '').trim())) return 'â€”';
+    const rt = ticket['Resolution Time (hrs)'];
+    if (rt === null || rt === undefined || rt === '') return 'â€”';
+    const hrs = parseFloat(rt);
+    if (isNaN(hrs)) return 'â€”';
+    const h = Math.floor(hrs);
+    const m = Math.round((hrs - h) * 60);
+    return `${h}h ${m}m`;
+}
+
+/*************************
  * UTILITIES
  *************************/
 // Hours Outstanding is calculated in real time on the frontend.
-// This function computes: (Current time - Created timestamp) in hours.
-// Any "Hours Outstanding" value from Excel/API is ignored.
+// For Resolved tickets: use Resolution Time (hrs) from the API (Resolved - Created).
+// For all others: (Current time - Created timestamp) in hours.
 function calculateHoursOutstanding(ticket) {
     if (!ticket.Created) return '';
-    
+
+    // Resolved tickets: use the pre-computed resolution time
+    const slaVal = ticket['SLA'] || '';
+    if (slaVal === 'Resolved' || slaVal === 'Resolved Within SLA' || (slaVal === 'SLA Breached' && isResolvedState(String(ticket.State || '').trim()))) {
+        const rt = ticket['Resolution Time (hrs)'];
+        if (rt !== null && rt !== undefined && rt !== '') {
+            return parseFloat(rt).toFixed(2);
+        }
+    }
+
     const createdDate = new Date(ticket.Created);
     if (isNaN(createdDate.getTime())) return '';
     
@@ -1650,10 +1916,21 @@ function calculateHoursOutstanding(ticket) {
 }
 
 // Days Standing is calculated in real time.
-// (Current time - Created timestamp) in whole days (rounded down).
+// For Resolved tickets: use Resolution Time (hrs) / 24.
+// For others: (Current time - Created timestamp) in whole days (rounded down).
 function calculateDaysStanding(ticket) {
     if (!ticket.Created) return 'NA';
-    
+
+    // Resolved tickets: days from creation to resolution
+    const slaVal2 = ticket['SLA'] || '';
+    if (slaVal2 === 'Resolved' || slaVal2 === 'Resolved Within SLA' || (slaVal2 === 'SLA Breached' && isResolvedState(String(ticket.State || '').trim()))) {
+        const rt = ticket['Resolution Time (hrs)'];
+        if (rt !== null && rt !== undefined && rt !== '') {
+            const days = Math.floor(parseFloat(rt) / 24);
+            return days < 0 ? 0 : days;
+        }
+    }
+
     const createdDate = new Date(ticket.Created);
     if (isNaN(createdDate.getTime())) return 'NA';
     
@@ -1713,14 +1990,14 @@ function clearAllFilters() {
 function showLoading() {
     const tbody = document.getElementById('ticketsTableBody');
     if (tbody) {
-        tbody.innerHTML = '<tr><td colspan="9" class="loading">Loading data...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" class="loading">Loading data...</td></tr>';
     }
 }
 
 function showError(message) {
     const tbody = document.getElementById('ticketsTableBody');
     if (tbody) {
-        tbody.innerHTML = `<tr><td colspan="9" class="error">${escapeHtml(message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="12" class="error">${escapeHtml(message)}</td></tr>`;
     }
 }
 
@@ -1728,8 +2005,9 @@ function showError(message) {
  * TABLE COLUMN FILTERS
  *************************/
 function setupTableColumnFilters() {
-    // Columns that should have filters (excluding "Number")
-    const filterableColumns = ['Priority', 'SLA', 'Team', 'Assignment group', 'Created'];
+    // Columns with header dropdown filters
+    // Computed columns (Hours Outstanding, Days Standing, SLA Countdown, Resolution Time) are excluded
+    const filterableColumns = ['State', 'Priority', 'SLA', 'Breached', 'Team', 'Assignment group', 'Created'];
     
     // Get all table headers
     const headers = document.querySelectorAll('.data-table thead tr th');
@@ -1771,6 +2049,17 @@ function setupTableColumnFilters() {
 }
 
 function populateColumnFilterOptions(select, columnName) {
+    // Breached: fixed Yes/No options
+    if (columnName === 'Breached') {
+        ['Yes', 'No'].forEach(value => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            select.appendChild(option);
+        });
+        return;
+    }
+
     // Get unique values from filteredTickets (not allTickets, to respect global filters)
     const uniqueValues = [...new Set(filteredTickets.map(t => {
         if (columnName === 'Created') {
@@ -1874,7 +2163,6 @@ function renderClosedTicketsList() {
         const closedDate = new Date(ticket.closedAt);
         const minutesAgo = Math.floor((now - closedDate) / (1000 * 60));
         const timeAgo = minutesAgo < 1 ? 'Just now' : `${minutesAgo} min ago`;
-        
         return `
             <div class="closed-ticket-item">
                 <div class="closed-ticket-row">
@@ -1884,53 +2172,718 @@ function renderClosedTicketsList() {
                     <span class="closed-ticket-separator">|</span>
                     <span class="closed-ticket-time">Closed ${timeAgo}</span>
                 </div>
-            </div>
-        `;
+            </div>`;
     }).join('');
 }
 
 function toggleClosedTicketsPanel() {
     const panel = document.getElementById('closedTicketsPanel');
-    if (!panel) {
-        console.error('closedTicketsPanel not found');
-        return;
-    }
+    if (!panel) return;
     panel.classList.toggle('open');
 }
 
-// =============================
-// Recently Closed Tickets
-// =============================
 async function loadRecentlyClosedTickets() {
     try {
         const res = await fetch("/api/recently-closed");
         const json = await res.json();
-
         const container = document.getElementById("closedTicketsList");
         if (!container) return;
-
         container.innerHTML = "";
-
         if (!json.success || !json.data || json.data.length === 0) {
             container.innerHTML = `<div class="closed-ticket-empty">No recently closed tickets</div>`;
             return;
         }
-
         json.data.forEach(ticket => {
             const div = document.createElement("div");
             div.className = "closed-ticket-item";
-
             div.innerHTML = `
-                <div class="closed-ticket-number">${ticket.Number || "—"}</div>
-                <div class="closed-ticket-time">
-                    Closed at: ${ticket.closed_at || ""}
-                </div>
-            `;
-
+                <div class="closed-ticket-number">${ticket.Number || "â€”"}</div>
+                <div class="closed-ticket-time">Closed at: ${ticket.closed_at || ""}</div>`;
             container.appendChild(div);
         });
-
     } catch (err) {
         console.error("Failed to load recently closed tickets", err);
     }
 }
+
+/*************************
+ * PDF REPORT
+ *************************/
+async function generatePDF() {
+    const btn = document.querySelector('.btn-pdf');
+    if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Generating…'; }
+
+    try {
+        const { jsPDF } = window.jspdf;
+        const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+        const PW = 297;
+        const PH = 210;
+        const MARGIN = 12;
+        const CONTENT_W = PW - MARGIN * 2;
+        let y = 0;
+
+        // ── Light colour palette ─────────────────────────────────────────
+        const C = {
+            white:    [255, 255, 255],
+            bg:       [248, 250, 252],   // very light grey page
+            surface:  [255, 255, 255],   // white cards
+            border:   [226, 232, 240],   // light grey border
+            accent:   [ 37, 99,  235],   // blue-600
+            accentLt: [219, 234, 254],   // blue-100
+            green:    [ 22, 163,  74],
+            greenLt:  [220, 252, 231],
+            red:      [220,  38,  38],
+            redLt:    [254, 226, 226],
+            yellow:   [217, 119,   6],
+            yellowLt: [254, 243, 199],
+            purple:   [ 79,  70, 229],
+            purpleLt: [237, 233, 254],
+            textPri:  [ 15,  23,  42],   // near-black
+            textSec:  [ 71,  85, 105],   // slate-600
+            textMid:  [100, 116, 139],   // slate-500
+        };
+
+        const fillRect = (x, fy, w, h, col) => {
+            pdf.setFillColor(...col);
+            pdf.rect(x, fy, w, h, 'F');
+        };
+        const drawRect = (x, fy, w, h, col, lw = 0.3) => {
+            pdf.setDrawColor(...col);
+            pdf.setLineWidth(lw);
+            pdf.rect(x, fy, w, h, 'S');
+        };
+        const setFont = (size, style = 'normal', col = C.textPri) => {
+            pdf.setFontSize(size);
+            pdf.setFont('helvetica', style);
+            pdf.setTextColor(...col);
+        };
+
+        // ── Capture chart canvas onto a WHITE background ─────────────────
+        const chartToImg = (canvasId) => {
+            const src = document.getElementById(canvasId);
+            if (!src) return null;
+
+            // Temporarily make datalabels black so they're visible on white PDF background
+            const chartInst = Object.values(chartInstances).find(c => c.canvas === src);
+            const originalColors = [];
+            if (chartInst) {
+                (chartInst.data.datasets || []).forEach((ds, i) => {
+                    const dl = (chartInst.options.plugins || {}).datalabels;
+                    originalColors.push(dl ? dl.color : undefined);
+                    if (dl) dl.color = '#111111';
+                });
+                chartInst.update('none');
+            }
+
+            const tmp = document.createElement('canvas');
+            tmp.width  = src.width;
+            tmp.height = src.height;
+            const ctx = tmp.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, tmp.width, tmp.height);
+            ctx.drawImage(src, 0, 0);
+            const result = tmp.toDataURL('image/png', 1.0);
+
+            // Restore original datalabel color
+            if (chartInst) {
+                const dl = (chartInst.options.plugins || {}).datalabels;
+                if (dl && originalColors.length > 0) dl.color = originalColors[0];
+                chartInst.update('none');
+            }
+
+            return result;
+        };
+
+        // ── PAGE BACKGROUND ──────────────────────────────────────────────
+        fillRect(0, 0, PW, PH, C.bg);
+
+        // ── HEADER ───────────────────────────────────────────────────────
+        fillRect(0, 0, PW, 24, C.white);
+        // blue top stripe
+        fillRect(0, 0, PW, 1.5, C.accent);
+        // bottom border
+        fillRect(0, 23, PW, 0.5, C.border);
+
+        // Logo pill
+        fillRect(MARGIN, 5, 26, 13, C.accentLt);
+        setFont(8, 'bold', C.accent);
+        pdf.text('TITAN', MARGIN + 13, 10.5, { align: 'center' });
+        setFont(5.5, 'normal', C.textMid);
+        pdf.text('SLA Monitor', MARGIN + 13, 15, { align: 'center' });
+
+        setFont(13, 'bold', C.textPri);
+        pdf.text('SLA Monitoring Report', MARGIN + 30, 11.5);
+
+        const now = new Date();
+        const dateStr = now.toLocaleString('en-IN', { dateStyle: 'long', timeStyle: 'short' });
+        setFont(7, 'normal', C.textSec);
+        pdf.text(`Generated: ${dateStr}`, MARGIN + 30, 18);
+
+        const fileInfo = document.getElementById('lastUpdated')?.textContent?.trim() || '';
+        if (fileInfo) {
+            setFont(6.5, 'normal', C.textMid);
+            pdf.text(fileInfo, PW - MARGIN, 18, { align: 'right' });
+        }
+
+        y = 29;
+
+        // ── KPI CARDS ────────────────────────────────────────────────────
+        const kpis = [
+            { id: 'kpi-total',    label: 'Total Tickets',    color: C.accent,  bg: C.accentLt  },
+            { id: 'kpi-breached', label: 'SLA Breached',     color: C.red,     bg: C.redLt     },
+            { id: 'kpi-pending',  label: 'Pending',          color: C.yellow,  bg: C.yellowLt  },
+            { id: 'kpi-wip',      label: 'Work in Progress', color: C.purple,  bg: C.purpleLt  },
+            { id: 'kpi-resolved', label: 'Resolved',         color: C.green,   bg: C.greenLt   },
+        ];
+        const cardW = CONTENT_W / kpis.length;
+        const cardH = 20;
+        kpis.forEach((k, i) => {
+            const val = document.getElementById(k.id)?.textContent || '-';
+            const cx = MARGIN + i * cardW;
+            fillRect(cx, y, cardW - 2, cardH, k.bg);
+            drawRect(cx, y, cardW - 2, cardH, C.border);
+            // top accent bar
+            fillRect(cx, y, cardW - 2, 2, k.color);
+            setFont(17, 'bold', k.color);
+            pdf.text(String(val), cx + (cardW - 2) / 2, y + 11, { align: 'center' });
+            setFont(6, 'normal', C.textSec);
+            pdf.text(k.label, cx + (cardW - 2) / 2, y + 17, { align: 'center' });
+        });
+
+        y += cardH + 5;
+
+        // ── SECTION HEADING ──────────────────────────────────────────────
+        const sectionHeading = (title) => {
+            setFont(8, 'bold', C.textSec);
+            pdf.text(title.toUpperCase(), MARGIN, y + 4);
+            fillRect(MARGIN, y + 5.5, CONTENT_W, 0.4, C.border);
+            y += 9;
+        };
+
+        sectionHeading('Analytics Overview');
+
+        // ── CHARTS GRID ──────────────────────────────────────────────────
+        const GAP = 3;
+        const CHART_H1 = 55;
+        const CHART_H2 = 50;
+        const col3W = (CONTENT_W - GAP * 2) / 3;
+
+        // Row 1 — 3 equal charts
+        const row1 = [
+            { id: 'chart-sla-status', title: 'Tickets by SLA Status' },
+            { id: 'chart-priority',   title: 'Breached by Priority'  },
+            { id: 'chart-aging',      title: 'Aging Buckets'         },
+        ];
+        row1.forEach((ch, i) => {
+            const cx = MARGIN + i * (col3W + GAP);
+            fillRect(cx, y, col3W, CHART_H1, C.surface);
+            drawRect(cx, y, col3W, CHART_H1, C.border);
+            // title bar
+            fillRect(cx, y, col3W, 7, C.bg);
+            fillRect(cx, y, col3W, 0.4, C.border);
+            setFont(6.5, 'bold', C.textSec);
+            pdf.text(ch.title, cx + col3W / 2, y + 5, { align: 'center' });
+            const img = chartToImg(ch.id);
+            if (img) pdf.addImage(img, 'PNG', cx + 1, y + 8, col3W - 2, CHART_H1 - 9, undefined, 'FAST');
+        });
+        y += CHART_H1 + GAP;
+
+        // Row 2 — team (1/3) + trend (2/3)
+        const teamW = col3W;
+        const trendW = CONTENT_W - teamW - GAP;
+
+        [
+            { id: 'chart-team',  title: 'Tickets by Team',            x: MARGIN,          w: teamW  },
+            { id: 'chart-trend', title: 'SLA Breach Trend Over Time', x: MARGIN+teamW+GAP, w: trendW },
+        ].forEach(ch => {
+            fillRect(ch.x, y, ch.w, CHART_H2, C.surface);
+            drawRect(ch.x, y, ch.w, CHART_H2, C.border);
+            fillRect(ch.x, y, ch.w, 7, C.bg);
+            fillRect(ch.x, y, ch.w, 0.4, C.border);
+            setFont(6.5, 'bold', C.textSec);
+            pdf.text(ch.title, ch.x + ch.w / 2, y + 5, { align: 'center' });
+            const img = chartToImg(ch.id);
+            if (img) pdf.addImage(img, 'PNG', ch.x + 1, y + 8, ch.w - 2, CHART_H2 - 9, undefined, 'FAST');
+        });
+
+        // ── FOOTER ───────────────────────────────────────────────────────
+        fillRect(0, PH - 7, PW, 7, C.white);
+        fillRect(0, PH - 7, PW, 0.4, C.border);
+        setFont(6.5, 'normal', C.textMid);
+        pdf.text('Titan Company Limited — SLA Monitoring Dashboard', MARGIN, PH - 2.5);
+        pdf.text('Page 1 of 1', PW - MARGIN, PH - 2.5, { align: 'right' });
+
+        // ── SAVE ─────────────────────────────────────────────────────────
+        const fname = `SLA_Report_${now.toISOString().slice(0, 10)}.pdf`;
+        pdf.save(fname);
+    } catch (err) {
+        console.error('PDF generation failed:', err);
+        alert('PDF generation failed: ' + err.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '&#128196; Download PDF'; }
+    }
+}
+
+/*************************
+ * FILE UPLOAD
+ *************************/
+async function handleFileUpload(input) {
+    const file = input.files[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const uploadBtn = document.querySelector('.btn-upload');
+    const fileNameEl = document.getElementById('uploadedFileName');
+    const clearBtn = document.getElementById('clearUploadBtn');
+
+    uploadBtn.textContent = '⏳ Uploading…';
+
+    try {
+        const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+        const json = await resp.json();
+
+        if (!resp.ok || !json.success) {
+            alert('Upload failed: ' + (json.detail || json.message || 'Unknown error'));
+            uploadBtn.innerHTML = '&#128196; Upload File';
+            return;
+        }
+
+        // Show uploaded filename
+        fileNameEl.textContent = json.filename;
+        fileNameEl.classList.add('active');
+        clearBtn.style.display = 'inline';
+        uploadBtn.innerHTML = '&#128196; Upload File';
+
+        // Reload dashboard with new data
+        await loadDashboardData();
+    } catch (err) {
+        alert('Upload error: ' + err.message);
+        uploadBtn.innerHTML = '&#128196; Upload File';
+    }
+
+    // Reset input so the same file can be re-uploaded if needed
+    input.value = '';
+}
+
+async function clearUploadedFile() {
+    try {
+        await fetch('/api/upload', { method: 'DELETE' });
+    } catch (_) { /* ignore */ }
+
+    const fileNameEl = document.getElementById('uploadedFileName');
+    const clearBtn = document.getElementById('clearUploadBtn');
+    fileNameEl.textContent = '';
+    fileNameEl.classList.remove('active');
+    clearBtn.style.display = 'none';
+
+    // Reload — will now fall back to SharePoint (or show an error if not configured)
+    await loadDashboardData();
+}
+
+async function checkUploadStatus() {
+    try {
+        const resp = await fetch('/api/upload/status');
+        if (!resp.ok) return;
+        const json = await resp.json();
+        if (json.active) {
+            const fileNameEl = document.getElementById('uploadedFileName');
+            const clearBtn = document.getElementById('clearUploadBtn');
+            fileNameEl.textContent = json.filename;
+            fileNameEl.classList.add('active');
+            clearBtn.style.display = 'inline';
+        }
+    } catch (_) { /* ignore */ }
+}
+
+
+function exportToCSV() {
+    // Start from filteredTickets (top-level filters) or allTickets if none active
+    let tickets = filteredTickets.length > 0 ? filteredTickets : allTickets;
+
+    // Also apply column header filters (tableFilterState) — same logic as renderTable
+    tickets = tickets.filter(t => {
+        if (tableFilterState.State && String(t['State'] || '') !== tableFilterState.State) return false;
+        if (tableFilterState.Priority && t.Priority !== tableFilterState.Priority) return false;
+        if (tableFilterState.SLA && t['SLA'] !== tableFilterState.SLA) return false;
+        if (tableFilterState.Breached !== '') {
+            const isBreached = isSLABreached(t) ? 'Yes' : 'No';
+            if (isBreached !== tableFilterState.Breached) return false;
+        }
+        if (tableFilterState.Team && t.Team !== tableFilterState.Team) return false;
+        if (tableFilterState['Assignment group'] && t['Assignment group'] !== tableFilterState['Assignment group']) return false;
+        if (tableFilterState.Created) {
+            if (!t.Created) return false;
+            const createdDate = new Date(t.Created);
+            if (isNaN(createdDate.getTime())) return false;
+            const ticketDate = createdDate.toISOString().split('T')[0];
+            if (ticketDate !== tableFilterState.Created) return false;
+        }
+        return true;
+    });
+
+    if (!tickets.length) return;
+
+    const headers = [
+        'Number', 'State', 'Priority', 'SLA', 'Breached', 'Hours Outstanding',
+        'Days Standing', 'SLA Countdown', 'Resolution Time (hrs)',
+        'Team', 'Assignment group', 'Created', 'Resolved'
+    ];
+
+    const rows = tickets.map(t => {
+        const countdown = calculateSLACountdown(t);
+        const resolutionHrs = (isResolvedState(String(t['State']||'').trim()) && t['Resolution Time (hrs)'] !== null && t['Resolution Time (hrs)'] !== undefined)
+            ? t['Resolution Time (hrs)'] : '';
+        return [
+            t.Number || '',
+            t.State || '',
+            t.Priority || '',
+            t.SLA || '',
+            isSLABreached(t) ? 'Yes' : 'No',
+            calculateHoursOutstanding(t),
+            calculateDaysStanding(t),
+            countdown.text,
+            resolutionHrs,
+            t.Team || '',
+            t['Assignment group'] || '',
+            t.Created || '',
+            t.Resolved || ''
+        ].map(v => `"${String(v).replace(/"/g, '""')}"`);
+    });
+
+    const csvContent = [headers.map(h => `"${h}"`).join(','), ...rows.map(r => r.join(','))].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sla_tickets_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+/*************************
+ * TICKET DETAIL MODAL
+ *************************/
+function openTicketModal(idx) {
+    const ticket = allTickets[idx];
+    if (!ticket) return;
+
+    const countdown = calculateSLACountdown(ticket);
+    const breached = isSLABreached(ticket);
+    const isResolved = isResolvedState(String(ticket.State || '').trim());
+    const isOverridden = ticket._overridden === true;
+    const ticketNum = String(ticket.Number || '');
+
+    // Resolve / Undo-Resolve button
+    let resolveButtonHtml = '';
+    if (isOverridden) {
+        resolveButtonHtml = `<button class="btn-unresolve" onclick="unresolveTicket('${escapeHtml(ticketNum)}')">&#8629; Undo Resolve</button>`;
+    } else if (!isResolved) {
+        resolveButtonHtml = `<button class="btn-resolve" onclick="showResolveForm('${escapeHtml(ticketNum)}')">&#10003; Mark as Resolved</button>`;
+    }
+
+    const topFields = ['Number', 'State', 'Priority', 'SLA', 'Team', 'Assignment group', 'Created', 'Resolved'];
+
+    const topHtml = topFields.map(key => {
+        let val = ticket[key];
+        if (val === null || val === undefined) val = '';
+        return `<div class="modal-field">
+            <span class="modal-field-label">${escapeHtml(key)}</span>
+            <span class="modal-field-value">${escapeHtml(String(val))}</span>
+        </div>`;
+    }).join('');
+
+    const computedHtml = `
+        <div class="modal-field">
+            <span class="modal-field-label">Hours Outstanding</span>
+            <span class="modal-field-value">${escapeHtml(String(calculateHoursOutstanding(ticket)))}</span>
+        </div>
+        <div class="modal-field">
+            <span class="modal-field-label">Days Standing</span>
+            <span class="modal-field-value">${escapeHtml(String(calculateDaysStanding(ticket)))}</span>
+        </div>
+        <div class="modal-field">
+            <span class="modal-field-label">SLA Countdown</span>
+            <span class="modal-field-value ${countdown.class}">${escapeHtml(countdown.text)}</span>
+        </div>
+        <div class="modal-field">
+            <span class="modal-field-label">Resolution Time</span>
+            <span class="modal-field-value">${escapeHtml(formatResolutionTime(ticket))}</span>
+        </div>
+        <div class="modal-field">
+            <span class="modal-field-label">SLA Breached</span>
+            <span class="modal-field-value">${breached ? '<span class="badge-breached">&#10006; Yes</span>' : '<span class="badge-ok">&#10003; No</span>'}</span>
+        </div>`;
+
+    const skipKeys = new Set([...topFields, 'Hours Outstanding', 'Resolution Time (hrs)', '_overridden', '_resolved_at', '_resolve_comment']);
+    const extraFields = Object.keys(ticket).filter(k => !skipKeys.has(k));
+
+    // Show resolve comment if ticket was manually resolved
+    let resolveCommentHtml = '';
+    if (isOverridden && ticket._resolve_comment) {
+        resolveCommentHtml = `
+            <div class="modal-section-title">Resolve Notes</div>
+            <div class="resolve-comment-box">${escapeHtml(ticket._resolve_comment)}</div>`;
+    }
+    let extraHtml = '';
+    if (extraFields.length) {
+        const extraItems = extraFields.map(key => {
+            let val = ticket[key];
+            if (val === null || val === undefined) val = '';
+            return `<div class="modal-field">
+                <span class="modal-field-label">${escapeHtml(key)}</span>
+                <span class="modal-field-value">${escapeHtml(String(val))}</span>
+            </div>`;
+        }).join('');
+        extraHtml = `<div class="modal-section-title">All Fields</div><div class="modal-fields-grid">${extraItems}</div>`;
+    }
+
+    let modal = document.getElementById('ticketDetailModal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'ticketDetailModal';
+        modal.className = 'ticket-modal-overlay';
+        modal.onclick = (e) => { if (e.target === modal) closeTicketModal(); };
+        document.body.appendChild(modal);
+    }
+
+    modal.innerHTML = `
+        <div class="ticket-modal">
+            <div class="ticket-modal-header">
+                <h2>Ticket #${escapeHtml(ticketNum)}</h2>
+                <div class="modal-header-actions">
+                    ${resolveButtonHtml}
+                    <button class="ticket-modal-close" onclick="closeTicketModal()">&#10005;</button>
+                </div>
+            </div>
+            <div class="ticket-modal-body">
+                <div class="modal-section-title">Summary</div>
+                <div class="modal-fields-grid">${topHtml}${computedHtml}</div>
+                ${resolveCommentHtml}
+                <div id="resolveFormContainer"></div>
+                ${extraHtml}
+            </div>
+        </div>`;
+
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+}
+
+function closeTicketModal() {
+    const modal = document.getElementById('ticketDetailModal');
+    if (modal) modal.style.display = 'none';
+    document.body.style.overflow = '';
+}
+
+/*************************
+ * RESOLVE / UNRESOLVE TICKET
+ *************************/
+function showResolveForm(number) {
+    const container = document.getElementById('resolveFormContainer');
+    if (!container) return;
+    container.innerHTML = `
+        <div class="resolve-form" id="resolveForm_${escapeHtml(number)}">
+            <div class="modal-section-title">Resolve Notes</div>
+            <textarea id="resolveComment" class="resolve-comment-input"
+                placeholder="Add a comment or reason for resolving (optional)..."
+                rows="3"></textarea>
+            <div class="resolve-form-actions">
+                <button class="btn-resolve" onclick="resolveTicket('${escapeHtml(number)}')">&#10003; Confirm Resolve</button>
+                <button class="btn-cancel-resolve" onclick="document.getElementById('resolveFormContainer').innerHTML=''">Cancel</button>
+            </div>
+        </div>`;
+    document.getElementById('resolveComment')?.focus();
+}
+
+async function resolveTicket(number) {
+    const comment = document.getElementById('resolveComment')?.value?.trim() || '';
+    try {
+        const res = await fetch(`/api/tickets/${encodeURIComponent(number)}/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ comment })
+        });
+        if (!res.ok) { alert('Failed to resolve ticket. Is the database configured?'); return; }
+
+        // Optimistic UI update
+        const ticket = allTickets.find(t => String(t.Number) === String(number));
+        if (ticket) {
+            ticket.State = 'Resolved';
+            ticket._overridden = true;
+            ticket._resolve_comment = comment;
+            ticket.SLA = computeSLAStatus(ticket);
+        }
+        applyFilters();
+        closeTicketModal();
+    } catch (err) {
+        console.error('resolveTicket error:', err);
+        alert('Failed to resolve ticket. Check the browser console for details.');
+    }
+}
+
+async function unresolveTicket(number) {
+    try {
+        const res = await fetch(`/api/tickets/${encodeURIComponent(number)}/resolve`, { method: 'DELETE' });
+        if (!res.ok) { alert('Failed to undo resolve. Is the database configured?'); return; }
+
+        // Reload from server to restore original Excel state
+        closeTicketModal();
+        await loadDashboardData(false);
+    } catch (err) {
+        console.error('unresolveTicket error:', err);
+        alert('Failed to undo resolve. Check the browser console for details.');
+    }
+}
+
+/*************************
+ * HISTORY MODAL
+ *************************/
+async function openHistoryModal() {
+    const overlay = document.getElementById('historyModalOverlay');
+    const body = document.getElementById('historyModalBody');
+    const title = document.getElementById('historyModalTitle');
+    if (!overlay) return;
+
+    title.textContent = '\u{1F4CA} Snapshot History';
+    body.innerHTML = '<div class="history-loading">Loading snapshots\u2026</div>';
+    overlay.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+
+    try {
+        const res = await fetch('/api/history');
+        const json = await res.json();
+        if (!json.success || !json.data.length) {
+            body.innerHTML = '<div class="history-empty">No snapshots yet. Snapshots are saved automatically each time tickets are fetched from SharePoint.</div>';
+            return;
+        }
+        renderSnapshotList(json.data);
+    } catch (err) {
+        body.innerHTML = `<div class="history-empty">Failed to load history: ${escapeHtml(String(err))}</div>`;
+    }
+}
+
+function closeHistoryModal() {
+    const overlay = document.getElementById('historyModalOverlay');
+    if (overlay) overlay.style.display = 'none';
+    document.body.style.overflow = '';
+}
+
+function renderSnapshotList(snapshots) {
+    const body = document.getElementById('historyModalBody');
+    const title = document.getElementById('historyModalTitle');
+    title.innerHTML = '&#128202; Snapshot History';
+
+    const rows = snapshots.map((s, i) => `
+        <tr>
+            <td>${i + 1}</td>
+            <td>${escapeHtml(String(s.fetched_at || ''))}</td>
+            <td>${escapeHtml(String(s.file_name || '—'))}</td>
+            <td>${s.ticket_count}</td>
+            <td><button class="btn-view-snapshot" onclick="viewSnapshot(${s.id})">View</button></td>
+        </tr>`).join('');
+
+    body.innerHTML = `
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Fetched At</th>
+                    <th>File Name</th>
+                    <th>Tickets</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
+async function viewSnapshot(id) {
+    const body = document.getElementById('historyModalBody');
+    const title = document.getElementById('historyModalTitle');
+
+    body.innerHTML = '<div class="history-loading">Loading snapshot&#8230;</div>';
+
+    try {
+        const res = await fetch(`/api/history/${id}`);
+        const json = await res.json();
+        if (!json.success) { body.innerHTML = '<div class="history-empty">Failed to load snapshot tickets.</div>'; return; }
+
+        const tickets = (json.data || []).map(t => {
+            const copy = { ...t };
+            copy.SLA = computeSLAStatus(copy);
+            return copy;
+        });
+        const fileName = json.file_name || '';
+        const fetchedAt = json.fetched_at || '';
+
+        title.innerHTML = `<button class="btn-back-history" onclick="openHistoryModal()">&#8592; Back</button>
+            <span style="font-size:0.9rem;font-weight:400;color:var(--text-secondary);">
+                ${escapeHtml(fetchedAt)}${fileName ? ' &mdash; <em>' + escapeHtml(fileName) + '</em>' : ''}
+                &mdash; ${tickets.length} tickets
+            </span>`;
+
+        if (!tickets.length) { body.innerHTML = '<div class="history-empty">No tickets in this snapshot.</div>'; return; }
+
+        // ── KPIs ──────────────────────────────────────────────────────────
+        let total = tickets.length, breached = 0, pending = 0, wip = 0, resolved = 0;
+        const priorityBreachCount = {};
+        const teamCount = {};
+        tickets.forEach(t => {
+            if (isSLABreached(t)) breached++;
+            const state = String(t.State || '').trim();
+            if (isResolvedState(state)) resolved++;
+            else if (state === 'Work in Progress') wip++;
+            else pending++;
+
+            const pri = t.Priority || 'Unknown';
+            if (isSLABreached(t)) priorityBreachCount[pri] = (priorityBreachCount[pri] || 0) + 1;
+            teamCount[t.Team || 'Others'] = (teamCount[t.Team || 'Others'] || 0) + 1;
+        });
+
+        // ── SLA status distribution ──────────────────────────────────────
+        const slaCount = {};
+        tickets.forEach(t => { slaCount[t.SLA || 'Unknown'] = (slaCount[t.SLA] || 0) + 1; });
+
+        // ── Table rows ────────────────────────────────────────────────────
+        const cols = ['Number', 'State', 'Priority', 'SLA', 'Team', 'Assignment group', 'Created', 'Resolved', 'Resolution Time (hrs)'];
+        const headerRow = cols.map(c => `<th>${escapeHtml(c)}</th>`).join('') + '<th>Breached</th><th>Hours Outstanding</th>';
+        const dataRows = tickets.map(t => {
+            const breachedCell = isSLABreached(t)
+                ? '<span class="badge-breached">&#10006; Yes</span>'
+                : '<span class="badge-ok">&#10003; No</span>';
+            const cells = cols.map(c => `<td>${escapeHtml(String(t[c] ?? ''))}</td>`).join('');
+            const rowClass = isSLABreached(t) ? 'row-breached' : (String(t.State || '') === 'Resolved' ? 'row-resolved' : '');
+            return `<tr class="${rowClass}">${cells}<td>${breachedCell}</td><td>${escapeHtml(String(calculateHoursOutstanding(t)))}</td></tr>`;
+        }).join('');
+
+        body.innerHTML = `
+            <!-- KPI strip -->
+            <div class="hist-kpis">
+                <div class="hist-kpi"><div class="hist-kpi-label">Total</div><div class="hist-kpi-val">${total}</div></div>
+                <div class="hist-kpi hist-kpi-breached"><div class="hist-kpi-label">SLA Breached</div><div class="hist-kpi-val">${breached}</div></div>
+                <div class="hist-kpi hist-kpi-pending"><div class="hist-kpi-label">Pending</div><div class="hist-kpi-val">${pending}</div></div>
+                <div class="hist-kpi hist-kpi-wip"><div class="hist-kpi-label">Work in Progress</div><div class="hist-kpi-val">${wip}</div></div>
+                <div class="hist-kpi hist-kpi-resolved"><div class="hist-kpi-label">Resolved</div><div class="hist-kpi-val">${resolved}</div></div>
+            </div>
+
+            <!-- Full ticket table -->
+            <div class="history-table-wrap" style="margin-top:16px;">
+                <table class="history-table data-table">
+                    <thead><tr>${headerRow}</tr></thead>
+                    <tbody>${dataRows}</tbody>
+                </table>
+            </div>`;
+    } catch (err) {
+        body.innerHTML = `<div class="history-empty">Error: ${escapeHtml(String(err))}</div>`;
+    }
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        closeTicketModal();
+        closeHistoryModal();
+    }
+});

@@ -7,3 +7,7 @@ jinja2==3.1.2
 aiofiles==23.2.1
 requests==2.32.3
 python-dotenv==1.0.1
+# truststore is Windows-only (corporate SSL); not needed on Linux
+# truststore
+# psycopg2-binary is kept for legacy PostgreSQL support (unused if SQLite is active)
+# psycopg2-binary

@@ -1,3 +1,13 @@
+import sys
+try:
+    if sys.platform == 'win32':
+        import truststore
+        truststore.inject_into_ssl()  # Use Windows certificate store (fixes corporate SSL inspection)
+except ImportError:
+    pass  # truststore not required on Linux
+
+import database as db
+
 import pandas as pd
 import json
 from datetime import datetime, timedelta
@@ -22,21 +32,43 @@ CLOSED_FILE = "recently_closed.json"
 def load_json(path):
     if not os.path.exists(path):
         return []
-    with open(path, "r") as f:
-        return json.load(f)
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Corrupted JSON file %s — resetting to empty list.", path)
+        return []
+
+def _json_default(obj):
+    """Serialize types that standard json cannot handle (e.g. pandas Timestamp, numpy types)."""
+    import pandas as pd
+    import numpy as np
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.isoformat() if not pd.isna(obj) else None
+    if isinstance(obj, float) and (obj != obj):  # NaN
+        return None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return str(obj)
 
 def save_json(path, data):
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, default=_json_default)
 
 
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.templating import Jinja2Templates
+from pydantic import BaseModel
 import pandas as pd
+import io
 from typing import Dict, Any
 
 app = FastAPI(title="SLA Monitoring API", version="1.0.0")
@@ -63,6 +95,9 @@ async def _graph_auth_startup_check():
     # NOTE: Delegated auth requires an interactive user sign-in.
     # We intentionally do NOT attempt token acquisition at startup.
     logger.info("Graph delegated auth ready (visit /auth/login to sign in)")
+
+    # Initialise PostgreSQL schema (no-op if DATABASE_URL not set)
+    db.init_db()
 
 
 # =============================
@@ -228,12 +263,23 @@ app.add_middleware(
 # =============================
 EXCEL_FILE_PATH = r"D:\Onedrive_Reju\OneDrive - Titan Company Limited\Sla_data\sla_pending(1).xlsx"
 
+# =============================
+# In-memory uploaded file store
+# =============================
+# Holds the bytes of the most recently uploaded Excel/CSV file.
+# Set by POST /api/upload, consumed by read_excel().
+_uploaded_file: dict | None = None  # {"bytes": bytes, "filename": str}
+
 
 COLUMNS = {
     "number": "Number",
     "priority": "Priority",
     "state": "State",
     "created": "Created",
+    "resolved": "Resolved",
+    "short_description": "Short description",
+    "contact_email": "Contact Email ID",
+    "description": "Description text",
     "hours": "Hours Outstanding",
     "sla": "SLA",
     "team": "Team",
@@ -244,13 +290,23 @@ COLUMNS = {
 # Excel reader (NO CACHE)
 # =============================
 def read_excel() -> pd.DataFrame:
+    global _uploaded_file
     try:
-        # Always read the first sheet (sheet name may be anything).
-        # Data source: SharePoint via Microsoft Graph (read-only).
-        from graph_sharepoint_excel import fetch_latest_excel_first_sheet_as_dataframe
-
-        df = fetch_latest_excel_first_sheet_as_dataframe()
-        df.columns = df.columns.str.strip()
+        # ── NEW: Use uploaded file if one has been provided ───────────────
+        if _uploaded_file is not None:
+            fname = _uploaded_file["filename"]
+            raw = io.BytesIO(_uploaded_file["bytes"])
+            if fname.lower().endswith(".csv"):
+                df = pd.read_csv(raw)
+            else:
+                df = pd.read_excel(raw, sheet_name=0)
+            _excel_filename = fname
+            df.columns = df.columns.str.strip()
+        else:
+            # ── LEGACY: SharePoint / Microsoft Graph path ─────────────────
+            from graph_sharepoint_excel import fetch_latest_excel_first_sheet_as_dataframe
+            df, _excel_filename = fetch_latest_excel_first_sheet_as_dataframe()
+            df.columns = df.columns.str.strip()
 
         df = df.where(pd.notnull(df), None)
 
@@ -269,9 +325,20 @@ def read_excel() -> pd.DataFrame:
         df = df.dropna(how="all").reset_index(drop=True)
 
         if COLUMNS["created"] in df.columns:
-            df[COLUMNS["created"]] = pd.to_datetime(
-                df[COLUMNS["created"]], errors="coerce"
-            ).dt.strftime("%Y-%m-%d %H:%M:%S")
+            # Compute Resolution Time (hrs) before converting Created to string
+            created_dt = pd.to_datetime(df[COLUMNS["created"]], errors="coerce")
+            if COLUMNS["resolved"] in df.columns:
+                resolved_dt = pd.to_datetime(df[COLUMNS["resolved"]], errors="coerce")
+                resolution_secs = (resolved_dt - created_dt).dt.total_seconds()
+                df["Resolution Time (hrs)"] = (resolution_secs / 3600).round(2)
+                # Keep None where resolution time is invalid/missing
+                df["Resolution Time (hrs)"] = df["Resolution Time (hrs)"].where(
+                    pd.notnull(df["Resolution Time (hrs)"]), None
+                )
+                # Format Resolved column as a readable string
+                df[COLUMNS["resolved"]] = resolved_dt.dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            df[COLUMNS["created"]] = created_dt.dt.strftime("%Y-%m-%d %H:%M:%S")
 
         # =============================
         # Team Resolution Logic (Precedence)
@@ -288,8 +355,8 @@ def read_excel() -> pd.DataFrame:
                 if team_str and team_str.lower() != "nan":
                     return team_str
             
-            # 2. ELSE IF Email exists in EMAIL_TEAM_MAP
-            email = row.get("Email")
+            # 2. ELSE IF Contact Email ID (or legacy Email) exists in EMAIL_TEAM_MAP
+            email = row.get(COLUMNS["contact_email"]) or row.get("Email")
             # If Email is blank/NaN, keep default "Others"
             if email is not None and not pd.isna(email):
                 # Some rows contain multiple email IDs separated by commas/semicolons.
@@ -314,8 +381,10 @@ def read_excel() -> pd.DataFrame:
         # Ensure Team is always filled (never NaN)
         df[COLUMNS["team"]] = df[COLUMNS["team"]].where(pd.notnull(df[COLUMNS["team"]]), "Others")
 
-        return df
+        return df, _excel_filename
 
+    except HTTPException:
+        raise
     except Exception as e:
         msg = str(e)
         # Graceful auth/access handling for delegated Graph tokens
@@ -379,18 +448,63 @@ def detect_deleted_tickets(current_records):
 # Tickets API
 # =============================
 @app.get("/api/tickets")
-async def get_tickets() -> Dict[str, Any]:
-    df = read_excel()
+async def get_tickets():
+    import math
+    import numpy as np
+
+    df, _excel_filename = read_excel()
     records = df.to_dict("records")
+
+    # Sanitize every value — converts NaN/Inf/numpy types to JSON-safe Python types.
+    # Must happen before detect_deleted_tickets (save_json) AND before JSONResponse.
+    def _sanitize(val):
+        if val is None:
+            return None
+        import pandas as pd
+        # NaT must be checked before Timestamp (NaT is a subtype)
+        if val is pd.NaT:
+            return None
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        if isinstance(val, np.integer):
+            return int(val)
+        if isinstance(val, np.floating):
+            return None if (math.isnan(val) or math.isinf(val)) else float(val)
+        if isinstance(val, np.bool_):
+            return bool(val)
+        if isinstance(val, pd.Timestamp):
+            return None if pd.isna(val) else val.isoformat()
+        return val
+
+    records = [{k: _sanitize(v) for k, v in row.items()} for row in records]
+
+    # Apply manual ticket-state overrides from the database
+    overrides = db.get_overrides()  # {ticket_number: {state, resolved_at, comment}}
+    for record in records:
+        num = str(record.get("Number") or "")
+        if num in overrides:
+            record["State"] = overrides[num]["state"]
+            record["_overridden"] = True
+            record["_resolved_at"] = overrides[num]["resolved_at"]
+            record["_resolve_comment"] = overrides[num].get("comment", "")
 
     # 🔥 Detect deleted tickets HERE
     detect_deleted_tickets(records)
 
-    return {
+    # Save snapshot to DB (background thread so response is not delayed)
+    import threading
+    threading.Thread(
+        target=db.save_snapshot,
+        args=(records, _excel_filename),
+        daemon=True,
+    ).start()
+
+    # Return via JSONResponse to bypass FastAPI/Pydantic serialization entirely.
+    return JSONResponse(content={
         "success": True,
-        "count": len(df),
+        "count": len(records),
         "data": records
-    }
+    })
 
 
 # =============================
@@ -398,7 +512,7 @@ async def get_tickets() -> Dict[str, Any]:
 # =============================
 @app.get("/api/kpis")
 async def get_kpis() -> Dict[str, Any]:
-    df = read_excel()
+    df, _ = read_excel()
 
     if df.empty:
         return {"success": True, "kpis": {}}
@@ -435,7 +549,7 @@ async def get_kpis() -> Dict[str, Any]:
 # =============================
 @app.get("/api/aging-buckets")
 async def aging_buckets():
-    df = read_excel()
+    df, _ = read_excel()
 
     
 
@@ -462,7 +576,7 @@ async def aging_buckets():
 # =============================
 @app.get("/api/top-oldest-tickets")
 async def top_oldest():
-    df = read_excel()
+    df, _ = read_excel()
 
     if COLUMNS["hours"] not in df.columns:
         return {"success": True, "data": []}
@@ -481,7 +595,7 @@ async def top_oldest():
 # =============================
 @app.get("/api/created-trend")
 async def created_trend():
-    df = read_excel()
+    df, _ = read_excel()
 
     if COLUMNS["created"] not in df.columns or COLUMNS["sla"] not in df.columns:
         return {"success": True, "chart_data": []}
@@ -503,15 +617,51 @@ async def created_trend():
 
 
 # =============================
+# File Upload API
+# =============================
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Upload an Excel (.xlsx / .xls) or CSV file to use as the ticket data source.
+    The file is stored in-memory for the lifetime of the server process.
+    Subsequent calls to /api/tickets (and all other data APIs) will use this file.
+    """
+    global _uploaded_file
+
+    fname = file.filename or ""
+    if not any(fname.lower().endswith(ext) for ext in (".xlsx", ".xls", ".csv")):
+        raise HTTPException(status_code=400, detail="Only .xlsx, .xls or .csv files are accepted.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    _uploaded_file = {"bytes": contents, "filename": fname}
+    logger.info("File uploaded: %s (%d bytes)", fname, len(contents))
+    return {"success": True, "filename": fname, "size_bytes": len(contents)}
+
+
+@app.delete("/api/upload")
+async def clear_uploaded_file():
+    """Remove the in-memory uploaded file so the app falls back to SharePoint."""
+    global _uploaded_file
+    _uploaded_file = None
+    return {"success": True, "message": "Uploaded file cleared. Falling back to SharePoint data source."}
+
+
+@app.get("/api/upload/status")
+async def upload_status():
+    """Return whether an uploaded file is currently active."""
+    if _uploaded_file:
+        return {"active": True, "filename": _uploaded_file["filename"], "size_bytes": len(_uploaded_file["bytes"])}
+    return {"active": False}
+
+
+# =============================
 # Dashboard UI
 # =============================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    # If not signed in, redirect to Microsoft login.
-    from graph_auth import hasDelegatedGraphToken
-
-    if not hasDelegatedGraphToken():
-        return RedirectResponse("/auth/login")
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
@@ -621,6 +771,56 @@ async def recently_closed():
         print("RECENTLY CLOSED ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
+# =============================
+# Ticket History (Snapshots)
+# =============================
+@app.get("/api/history")
+async def get_history():
+    """List all snapshots, most recent first."""
+    snapshots = db.list_snapshots()
+    return JSONResponse(content={"success": True, "data": snapshots})
+
+
+@app.get("/api/history/{snapshot_id}")
+async def get_history_snapshot(snapshot_id: int):
+    """Return all ticket records for a given snapshot, plus metadata."""
+    result = db.get_snapshot_tickets(snapshot_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    tickets = result.pop("tickets", [])
+    return JSONResponse(content={
+        "success": True,
+        "count": len(tickets),
+        "data": tickets,
+        **result  # includes id, fetched_at, file_name, ticket_count
+    })
+
+
+# =============================
+# Ticket State Override (Resolve)
+# =============================
+class ResolveRequest(BaseModel):
+    comment: str = ""
+
+@app.post("/api/tickets/{ticket_number}/resolve")
+async def resolve_ticket(ticket_number: str, body: ResolveRequest = ResolveRequest()):
+    """Mark a ticket as Resolved via a manual override stored in DB."""
+    ok = db.set_override(ticket_number, state="Resolved", comment=body.comment)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Database unavailable or write failed")
+    return {"success": True, "ticket_number": ticket_number, "state": "Resolved"}
+
+
+@app.delete("/api/tickets/{ticket_number}/resolve")
+async def unresolve_ticket(ticket_number: str):
+    """Remove a manual Resolved override (reverts to Excel state on next fetch)."""
+    ok = db.remove_override(ticket_number)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Database unavailable or write failed")
+    return {"success": True, "ticket_number": ticket_number}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+    
