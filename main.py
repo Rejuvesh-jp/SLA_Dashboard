@@ -10,6 +10,7 @@ import database as db
 
 import pandas as pd
 import json
+from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import os
 import logging
@@ -69,7 +70,6 @@ from starlette.templating import Jinja2Templates
 from pydantic import BaseModel
 import pandas as pd
 import io
-from typing import Dict, Any
 
 app = FastAPI(title="SLA Monitoring API", version="1.0.0")
 
@@ -120,7 +120,7 @@ async def auth_login():
 
 
 @app.get("/auth/callback")
-async def auth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+async def auth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     # Microsoft may return error params instead of code
     if error:
         logger.error("Microsoft Graph authentication failed (error=%s)", error)
@@ -268,7 +268,7 @@ EXCEL_FILE_PATH = r"D:\Onedrive_Reju\OneDrive - Titan Company Limited\Sla_data\s
 # =============================
 # Holds the bytes of the most recently uploaded Excel/CSV file.
 # Set by POST /api/upload, consumed by read_excel().
-_uploaded_file: dict | None = None  # {"bytes": bytes, "filename": str}
+_uploaded_file: Optional[dict] = None  # {"bytes": bytes, "filename": str}
 
 
 COLUMNS = {

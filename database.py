@@ -13,6 +13,7 @@ Database file: sla_dashboard.db in the same folder as this module.
 
 import json
 import logging
+from typing import Optional
 import os
 import sqlite3
 from datetime import datetime
@@ -85,7 +86,7 @@ def init_db() -> bool:
         return False
 
 
-def save_snapshot(records: list, file_name: str = "") -> int | None:
+def save_snapshot(records: list, file_name: str = "") -> Optional[int]:
     """
     Persist a list of sanitised ticket dicts as a new snapshot.
     Automatically prunes snapshots beyond the last 500.
@@ -156,7 +157,7 @@ def list_snapshots() -> list:
         return []
 
 
-def get_snapshot_tickets(snapshot_id: int) -> dict | None:
+def get_snapshot_tickets(snapshot_id: int) -> Optional[dict]:
     """
     Return dict with snapshot metadata + ticket data list.
     Shape: {id, fetched_at, file_name, ticket_count, tickets: [...]}
